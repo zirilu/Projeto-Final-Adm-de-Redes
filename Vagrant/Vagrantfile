@@ -1,0 +1,235 @@
+Vagrant.configure("2") do |config|
+  # Definição da VM Server
+  config.vm.define "server" do |server|
+    server.vm.box = "ubuntu/bionic64" # Sistema operacional (Ubuntu 18.04 LTS)
+    server.vm.hostname = "dhcp-bind-server"
+
+    # Configuração da rede privada com IP fixo
+    server.vm.network "private_network", ip: "192.168.56.1", virtualbox__intnet: "dhcp_network"
+
+    server.vm.provider "virtualbox" do |vb|
+      vb.name = "dhcp-bind-server"
+    end
+
+    # Provisionamento da VM Server
+    server.vm.provision "shell", inline: <<-SHELL
+      # Atualizar pacotes
+      sudo apt-get update
+
+      # Instalar isc-dhcp-server e bind9
+      sudo apt-get install -y isc-dhcp-server bind9 bind9utils bind9-doc
+
+      ## Configuração do DHCP Server
+
+      # Configurar interfaces para o isc-dhcp-server
+      sudo sed -i 's/INTERFACESv4=""/INTERFACESv4="enp0s8"/' /etc/default/isc-dhcp-server
+
+      # Configurar o arquivo dhcpd.conf
+      sudo bash -c 'cat > /etc/dhcp/dhcpd.conf <<EOL
+default-lease-time 600;
+max-lease-time 7200;
+authoritative;
+
+subnet 192.168.56.0 netmask 255.255.255.0 {
+  range 192.168.56.10 192.168.56.100;
+  option routers 192.168.56.1;
+  option domain-name-servers 192.168.56.1; # Apontando para o servidor DNS local
+}
+EOL'
+
+      # Reiniciar e habilitar o serviço isc-dhcp-server
+      sudo systemctl restart isc-dhcp-server
+      sudo systemctl enable isc-dhcp-server
+
+      ## Configuração do BIND9
+
+      # Backup da configuração original
+      sudo cp /etc/bind/named.conf.options /etc/bind/named.conf.options.backup
+
+      # Configurar as opções do BIND9
+      sudo bash -c 'cat > /etc/bind/named.conf.options <<EOL
+options {
+    directory "/var/cache/bind";
+
+    // Escutar em todas as interfaces
+    listen-on { any; };
+    listen-on-v6 { any; };
+
+    // Permitir consultas de qualquer lugar
+    allow-query { any; };
+
+    // Encaminhadores (opcional, pode usar DNS públicos)
+    forwarders {
+        8.8.8.8;
+        8.8.4.4;
+    };
+
+    dnssec-validation auto;
+
+    auth-nxdomain no;    # conform to RFC1035
+    listen-on { any; };
+};
+EOL'
+
+      # Configurar zona DNS
+      sudo bash -c 'cat > /etc/bind/named.conf.local <<EOL
+zone "example.local" {
+    type master;
+    file "/etc/bind/db.example.local";
+};
+EOL'
+
+      # Criar arquivo de zona
+      sudo cp /etc/bind/db.local /etc/bind/db.example.local
+      sudo sed -i 's/localhost./example.local./' /etc/bind/db.example.local
+      sudo sed -i 's/127.0.0.1;/192.168.56.1;/' /etc/bind/db.example.local
+      sudo sed -i 's/255.255.255.255/192.168.56.1/' /etc/bind/db.example.local
+
+      # Verificar a configuração do BIND9
+      sudo named-checkconf
+      sudo named-checkzone example.local /etc/bind/db.example.local
+
+      # Reiniciar e habilitar o serviço BIND9
+      sudo systemctl restart bind9
+      sudo systemctl enable bind9
+
+      # Verificar o status do serviço BIND9
+      sudo systemctl status bind9 --no-pager
+
+      # Instalar NFS
+      sudo apt-get install -y nfs-kernel-server
+
+      # Criar diretório para compartilhamento
+      sudo mkdir -p /srv/nfs_share
+      sudo chmod 777 /srv/nfs_share
+
+      # Configurar o arquivo exports
+      echo "/srv/nfs_share 192.168.56.0/24(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
+
+      # Exportar os diretórios e reiniciar o serviço
+      sudo exportfs -ra
+      sudo systemctl restart nfs-kernel-server
+      sudo systemctl enable nfs-kernel-server
+
+      ## Instalação e Configuração do Apache
+
+      # Instalar Apache
+      sudo apt-get install -y apache2
+
+      # Criar diretório para o site estático
+      sudo mkdir -p /var/www/html/site
+
+      # Criar uma página HTML simples
+      sudo bash -c 'cat > /var/www/html/site/index.html <<EOL
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Site Estático</title>
+</head>
+<body>
+    <h1>Bem-vindo ao Site Estático!</h1>
+    <p>Este é um site servido pelo Apache.</p>
+</body>
+</html>
+EOL'
+
+      # Configurar Apache para servir o site estático
+      sudo bash -c 'cat > /etc/apache2/sites-available/site.conf <<EOL
+<VirtualHost *:80>
+    DocumentRoot /var/www/html/site
+    <Directory /var/www/html/site>
+        Require all granted
+        AllowOverride All
+    </Directory>
+</VirtualHost>
+EOL'
+
+      # Ativar configuração do site
+      sudo a2ensite site.conf
+
+      # Desativar configuração padrão
+      sudo a2dissite 000-default.conf
+
+      # Reiniciar e habilitar o Apache
+      sudo systemctl restart apache2
+      sudo systemctl enable apache2
+
+      ## Configuração do FTP
+
+      # Instalar vsftpd
+      sudo apt-get install -y vsftpd
+
+      # Configurar o arquivo de configuração do vsftpd
+      sudo bash -c 'cat > /etc/vsftpd.conf <<EOL
+listen=YES
+anonymous_enable=YES
+local_enable=YES
+write_enable=YES
+chroot_local_user=YES
+allow_writeable_chroot=YES
+local_umask=022
+pasv_min_port=40000
+pasv_max_port=50000
+pasv_address=192.168.56.1
+anon_root=/srv/ftp_share
+EOL'
+
+      # Criar um diretório para FTP e configurar permissões
+      sudo mkdir -p /srv/ftp_share
+      sudo chmod 755 /srv/ftp_share
+      sudo chmod 644 /srv/ftp_share/teste.txt
+      echo "Bem-vindo ao servidor FTP!" | sudo tee /srv/ftp_share/README.txt
+
+      # Reiniciar o serviço vsftpd
+      sudo systemctl restart vsftpd
+      sudo systemctl enable vsftpd
+    SHELL
+  end
+
+  # Definição da VM Client
+  config.vm.define "client" do |client|
+    client.vm.box = "ubuntu/bionic64" # Sistema operacional (Ubuntu 18.04 LTS)
+    client.vm.hostname = "dhcp-bind-client"
+
+    # Configuração da rede privada para obter IP via DHCP
+    client.vm.network "private_network", type: "dhcp", virtualbox__intnet: "dhcp_network"
+
+    client.vm.provider "virtualbox" do |vb|
+      vb.name = "dhcp-bind-client"
+    end
+
+    # Provisionamento da VM Client
+    client.vm.provision "shell", inline: <<-SHELL
+      # Atualizar pacotes
+      sudo apt-get update
+
+      # Instalar utilitários de rede
+      sudo apt-get install -y dnsutils curl
+
+      # Instalar NFS client
+      sudo apt-get install -y nfs-common
+
+      # Montar o diretório compartilhado
+      sudo mkdir -p /mnt/nfs_share
+      sudo mount 192.168.56.1:/srv/nfs_share /mnt/nfs_share
+
+      # Adicionar ao fstab para montagem automática
+      echo "192.168.56.1:/srv/nfs_share /mnt/nfs_share nfs defaults 0 0" | sudo tee -a /etc/fstab
+
+      # Testar o acesso ao site Apache
+      echo "Testando o site Apache no servidor..."
+      curl http://192.168.56.1
+
+      # Instalar cliente FTP
+      sudo apt-get install -y ftp
+
+      # Testar conexão FTP
+      echo "Testando conexão FTP com o servidor..."
+      ftp -inv 192.168.56.1 <<EOF
+user anonymous
+ls
+bye
+EOF
+    SHELL
+  end
+end
